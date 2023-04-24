@@ -72,9 +72,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         let url = tokens[1];
 
-                        for (addr, stream) in connections.iter_mut() {
-                            println!("{addr}");
-
+                        for (_, stream) in connections.iter_mut() {
                             let _ = stream.write_all(format!("{url}\r").as_bytes()).await;
                         }
                     }
@@ -143,11 +141,11 @@ async fn select_from_connections(
         return Err("no connections".into());
     }
 
-    match select_all(connections.iter_mut().map(|(id, stream)| {
+    match select_all(connections.iter_mut().map(|(addr, stream)| {
         Box::pin(async {
             stream.readable().await?;
 
-            Ok::<SocketAddr, Box<dyn Error>>(stream.peer_addr().unwrap())
+            Ok::<SocketAddr, Box<dyn Error>>(addr.clone())
         })
     }))
     .await
