@@ -1,13 +1,11 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::error::Error;
-use std::io;
-use std::net::SocketAddr;
-
-use futures::future::select_all;
-use tcp_server::job::{Job, Schedule};
+use tcp_server::job::Job;
+use tcp_server::schedule::{Schedule, ScheduleQueue};
+use tcp_server::selector::StreamSelector;
+use tcp_server::stream::StreamReader;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time;
+use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -18,17 +16,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
 
     loop {
-        let job = if let Some(job) = get_late_schedule(&mut schedule_queue) {
-            job
-        } else {
-            tokio::select! {
+        let job = match schedule_queue.get_late_schedule() {
+            Some(job) => job,
+            None => tokio::select! {
                 Ok((stream, _)) = listener.accept() => {
                     Job::Accept(stream)
                 }
-                Ok(_) = wait_first_schedule(&schedule_queue) => {
+                Ok(_) = schedule_queue.wait_first_schedule() => {
                     schedule_queue.pop().unwrap().job
                 },
-                Ok(addr) = select_from_connections(&mut connections) => {
+                Ok(addr) = connections.wait_for_readable() => {
                     Job::Read(addr)
                 },
             }
@@ -43,39 +40,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 connections.insert(addr, stream);
             }
             Job::Read(addr) => {
-                if let Some(stream) = connections.get_mut(&addr) {
-                    let mut buf = [0; 1024];
+                let Some(stream) = connections.get_mut(&addr) else {
+                    continue;
+                };
+                
+                let mut buf = [0; 1024];
 
-                    let n = match read_from(stream, &mut buf) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            eprintln!("{e}");
+                let n = match stream.try_read_until_block(&mut buf) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("{e}");
 
-                            schedule_queue.push(Schedule::now(Job::Drop(addr)));
+                        schedule_queue.push(Schedule::now(Job::Drop(addr)));
 
-                            continue;
-                        }
-                    };
-
-                    let value = String::from_utf8_lossy(&buf[..n]);
-
-                    let lines: Vec<&str> = value.split("\r").collect();
-
-                    if let Some(line) = lines.first() {
-                        let tokens: Vec<&str> = line.split(" ").collect();
-
-                        let method = tokens[0];
-
-                        if method != "GET" {
-                            continue;
-                        }
-
-                        let url = tokens[1];
-
-                        for (_, stream) in connections.iter_mut() {
-                            let _ = stream.write_all(format!("{url}\r").as_bytes()).await;
-                        }
+                        continue;
                     }
+                };
+
+                let value = String::from_utf8_lossy(&buf[..n]);
+
+                let lines: Vec<&str> = value.split("\r").collect();
+
+                let Some(line) = lines.first() else {
+                    continue;
+                };
+
+                let tokens: Vec<&str> = line.split(" ").collect();
+
+                let method = tokens[0];
+
+                if method != "GET" {
+                    continue;
+                }
+
+                let url = tokens[1];
+
+                for (_, stream) in connections.iter_mut() {
+                    let _ = stream.write_all(format!("{url}\r").as_bytes()).await;
                 }
             }
             Job::Drop(addr) => {
@@ -84,73 +85,5 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("{addr:?} dropped");
             }
         }
-    }
-}
-
-fn read_from(stream: &mut TcpStream, buf: &mut [u8]) -> io::Result<usize> {
-    let mut result = 0;
-
-    loop {
-        match stream.try_read(buf) {
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-            Ok(n) => {
-                result += n;
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                break;
-            }
-            Err(e) => return Err(io::Error::from(e)),
-        };
-    }
-
-    Ok(result)
-}
-
-fn get_late_schedule(schedule_queue: &mut BinaryHeap<Schedule<Job>>) -> Option<Job> {
-    if schedule_queue.is_empty() {
-        return None;
-    }
-
-    let first_schedule = schedule_queue.peek().unwrap();
-
-    if first_schedule.deadline > time::Instant::now() {
-        return None;
-    }
-
-    Some(schedule_queue.pop().unwrap().job)
-}
-
-async fn wait_first_schedule(
-    schedule_queue: &BinaryHeap<Schedule<Job>>,
-) -> Result<(), Box<dyn Error>> {
-    if schedule_queue.is_empty() {
-        return Err("no schedule".into());
-    }
-
-    let first_schedule = schedule_queue.peek().unwrap();
-
-    time::sleep_until(first_schedule.deadline).await;
-
-    Ok(())
-}
-
-async fn select_from_connections(
-    connections: &mut HashMap<SocketAddr, TcpStream>,
-) -> Result<SocketAddr, Box<dyn Error>> {
-    if connections.is_empty() {
-        return Err("no connections".into());
-    }
-
-    match select_all(connections.iter_mut().map(|(addr, stream)| {
-        Box::pin(async {
-            stream.readable().await?;
-
-            Ok::<SocketAddr, Box<dyn Error>>(addr.clone())
-        })
-    }))
-    .await
-    {
-        (Ok(id), _, _) => Ok(id),
-        (Err(e), _, _) => Err(e),
     }
 }
