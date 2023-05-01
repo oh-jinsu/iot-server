@@ -23,7 +23,7 @@ impl StreamReader for TcpStream {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;
                 }
-                Err(e) => return Err(io::Error::from(e)),
+                Err(e) => return Err(e),
             };
         }
     
