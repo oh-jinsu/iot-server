@@ -2,8 +2,13 @@ use std::net::SocketAddr;
 
 use tokio::net::TcpStream;
 
+pub enum From {
+    Client,
+    Node,
+}
+
 pub enum Job {
-    Accept(TcpStream),
-    Read(SocketAddr),
-    Drop(SocketAddr),
+    Accept(TcpStream, From),
+    Read(SocketAddr, From),
+    Drop(SocketAddr, From),
 }
